@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -8,6 +10,9 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+from cs336_basics.pretokenization_example import find_chunk_boundaries
+from cs336_basics.timer_utils import timer
 
 
 def run_linear(
@@ -561,7 +566,7 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
-
+@timer
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +594,72 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # 从文件中读取字符串
+    # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
+    # 2. 移除 special_token
+    chunks: list[bytes] = []
+    desired_num_chunks = 4
+    with open(input_path, "rb") as f:
+        # Q: 只考虑 <|endoftext|> 是否可行？是否需要考虑所有的 special_tokens？
+        boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode('utf-8')
+            pattern = "|".join([re.escape(token) for token in special_tokens])
+            for item in re.split(pattern, chunk):
+                item = item.strip()
+                if len(item) != 0:
+                    chunks.append(item.encode('utf-8'))
+
+
+    vocab: dict[int, bytes] = {}
+    merges: list[tuple[bytes, bytes]] = []
+
+    # 初始化词表
+    # 1. 0-255
+    # 2. special_token
+    for idx in range(0, 256):
+        vocab[idx] = bytes([idx])
+    for special_token in special_tokens:
+        vocab[len(vocab)] = special_token.encode('utf-8')
+    assert len(vocab) == 256 + len(special_tokens)
+
+    # 转换 chunks 的格式，便于操作
+    # list[bytes] -> list[list[bytes]]
+    new_chunks: list[list[bytes]] = []
+    for chunk in chunks:
+        new_chunks.append([chunk[idx:idx+1] for idx in range(len(chunk))])
+
+    # 统计每个 pair 对出现的频率，并寻找频率最高的一个
+    counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    for _ in range(0, vocab_size - len(vocab)):
+        for chunk in new_chunks:
+            for pair in zip(chunk[:-1], chunk[1:]):
+                counts[pair] += 1
+        # 先按照频率排序，如果频率相同，则按照字典序排序
+        max_freq = max(counts.items(), key=lambda x:(x[1], x[0]))
+
+        # 每一轮循环都会产生一个新的 token
+        token1, token2 = max_freq[0]
+        new_token = token1 + token2
+        vocab[len(vocab)] = new_token
+        merges.append((token1, token2))
+
+        def merge_helper(chunks, t1, t2):
+            new_chunks: list[list[bytes]] = []
+            for chunk in chunks:
+                idx = 0
+                new_chunk: list[bytes] = []
+                while idx < len(chunk):
+                    if idx + 1 < len(chunk) and chunk[idx] == t1 and chunk[idx+1] == t2:
+                        new_chunk.append(t1 + t2)
+                        idx += 2
+                    else:
+                        new_chunk.append(chunk[idx])
+                        idx += 1
+                new_chunks.append(new_chunk)
+            return new_chunks
+        # 合并 new_chunks 中的相关 token
+        new_chunks = merge_helper(new_chunks, token1, token2)
+
+    return (vocab, merges)
