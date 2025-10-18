@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections import defaultdict
 from collections.abc import Iterable
+from multiprocessing import Pool, Manager
+from threading import Thread
 from jaxtyping import Bool, Float, Int
-from multiprocessing.dummy import Pool as ThreadPool
 from torch import Tensor
 from typing import IO, Any, BinaryIO
 import numpy.typing as npt
@@ -629,9 +631,6 @@ def run_train_bpe_v1(
     gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
     for _, token in gpt2_bytes_to_unicode().items():
         vocab[len(vocab)] = bytes([gpt2_byte_decoder[t] for t in token])
-
-    for idx, token in vocab.items():
-        print(idx, token)
     assert len(vocab) == len(special_tokens) + 256
 
     # 转换 chunks 的格式，便于操作
@@ -702,6 +701,7 @@ def run_train_bpe_v2(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     # 从文件中读取字符串
     # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
     # 2. 移除 special_token
@@ -715,21 +715,22 @@ def run_train_bpe_v2(
             chunk = f.read(end - start).decode('utf-8')
             pattern = "|".join([re.escape(token) for token in special_tokens])
             for item in re.split(pattern, chunk):
-                item = item.strip()
                 if len(item) != 0:
-                    chunks.append(item.encode('utf-8'))
+                    # 预分词
+                    import regex
+                    for x in regex.findall(PAT, item):
+                        chunks.append(x.encode('utf-8'))
 
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
 
     # 初始化词表
-    # 1. 0-255
-    # 2. special_token
-    for idx in range(0, 256):
-        vocab[idx] = bytes([idx])
+    # 1. special_token
+    # 2. 0-255
     for special_token in special_tokens:
         vocab[len(vocab)] = special_token.encode('utf-8')
-    assert len(vocab) == 256 + len(special_tokens)
+    for idx in gpt2_bytes_to_unicode().keys():
+        vocab[len(vocab)] = bytes([idx])
 
     # 转换 chunks 的格式，便于操作
     # list[bytes] -> list[list[bytes]]
@@ -767,8 +768,10 @@ def run_train_bpe_v2(
                     if idx + 1 < len(chunk) and chunk[idx] == t1 and chunk[idx+1] == t2:
                         new_chunk.append(t1 + t2)
                         if idx - 1 >= 0:
+                            counts[(chunk[idx-1], t1)] -= 1
                             counts[(chunk[idx-1], t1 + t2)] += 1
                         if idx + 2 < len(chunk):
+                            counts[(t2, chunk[idx+2])] -= 1
                             counts[(t1 + t2, chunk[idx+2])] += 1
                         idx += 2
                     else:
@@ -782,6 +785,118 @@ def run_train_bpe_v2(
 
     return (vocab, merges)
 
+
+@timer
+def run_train_bpe_v3(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    **kwargs,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Given the path to an input corpus, run train a BPE tokenizer and
+    output its vocabulary and merges.
+
+    Args:
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+            These strings will never be split into multiple tokens, and will always be
+            kept as a single token. If these special tokens occur in the `input_path`,
+            they are treated as any other string.
+
+    Returns:
+        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+            vocab:
+                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+                to bytes (token bytes)
+            merges:
+                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+                representing that <token1> was merged with <token2>.
+                Merges are ordered by order of creation.
+    """
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    # 从文件中读取字符串
+    # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
+    # 2. 移除 special_token
+    chunks: dict[str, int] = defaultdict(int)
+    desired_num_chunks = 4
+    with open(input_path, "rb") as f:
+        # Q: 只考虑 <|endoftext|> 是否可行？是否需要考虑所有的 special_tokens？
+        boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode('utf-8')
+            pattern = "|".join([re.escape(token) for token in special_tokens])
+            for item in re.split(pattern, chunk):
+                if len(item) != 0:
+                    # 预分词
+                    import regex
+                    for x in regex.findall(PAT, item):
+                        chunks[x] += 1
+
+    vocab: dict[int, bytes] = {}
+    merges: list[tuple[bytes, bytes]] = []
+
+    # 初始化词表
+    # 1. special_token
+    # 2. 0-255
+    for special_token in special_tokens:
+        vocab[len(vocab)] = special_token.encode('utf-8')
+    for idx in gpt2_bytes_to_unicode().keys():
+        vocab[len(vocab)] = bytes([idx])
+    assert len(vocab) == len(special_tokens) + 256
+
+    # 维护 str 到 list(bytes) 的映射
+    # 当发生合并时，不更新 key 只更新 value
+    hash: dict[str, list(bytes)] = {}
+    for chunk, _ in chunks.items():
+        hash[chunk] = [bytes([b]) for b in chunk.encode("utf-8")]
+
+    # 统计每个 pair 对出现的频率，并寻找频率最高的一个
+    counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    # 预先计算一轮，将 counts 的内容填充
+    # 后续通过增量更新来降低算法复杂度，从而提升性能
+    for chunk, k in chunks.items():
+        for pair in zip(hash[chunk][:-1], hash[chunk][1:]):
+            counts[pair] += k
+
+    for _ in tqdm.tqdm(range(0, vocab_size - len(vocab))):
+        # 先按照频率排序，如果频率相同，则按照字典序排序
+        max_freq = max(counts.items(), key=lambda x:(x[1], x[0]))
+
+        # 每一轮循环都会产生一个新的 token
+        token1, token2 = max_freq[0]
+        new_token = token1 + token2
+        vocab[len(vocab)] = new_token
+        merges.append((token1, token2))
+
+        # 由于 token1 和 token2 已经被合并，那么 counts 不应该出现它们的组合
+        counts[(token1, token2)] = 0
+
+        def merge_helper(t1, t2):
+            for chunk, k in chunks.items():
+                bs = hash[chunk]
+                new_bs: list(bytes) = []
+                idx = 0
+                while idx < len(bs):
+                    if idx + 1 < len(bs) and bs[idx] == t1 and bs[idx+1] == t2:
+                        new_bs.append(t1 + t2)
+                        if idx - 1 >= 0:
+                            counts[(bs[idx-1], t1)] -= k
+                            counts[(bs[idx-1], t1 + t2)] += k
+                        if idx + 2 < len(bs):
+                            counts[(t2, bs[idx+2])] -= k
+                            counts[(t1 + t2, bs[idx+2])] += k
+                        idx += 2
+                    else:
+                        new_bs.append(bs[idx])
+                        idx += 1
+                hash[chunk] = new_bs
+
+        merge_helper(token1, token2)
+
+    return (vocab, merges)
+
 @timer
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -789,4 +904,4 @@ def run_train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    return run_train_bpe_v1(input_path, vocab_size, special_tokens, **kwargs)
+    return run_train_bpe_v3(input_path, vocab_size, special_tokens, **kwargs)

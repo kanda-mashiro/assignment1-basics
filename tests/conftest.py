@@ -1,3 +1,4 @@
+from math import exp
 from typing import TypeVar
 import numpy as np
 import pytest
