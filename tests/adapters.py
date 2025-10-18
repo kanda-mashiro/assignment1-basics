@@ -16,6 +16,7 @@ import tqdm
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.timer_utils import timer
+from cs336_basics.tokenizer import Tokenizer
 from tests.common import gpt2_bytes_to_unicode
 
 
@@ -568,7 +569,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 @timer
 def run_train_bpe_v1(
@@ -870,27 +871,33 @@ def run_train_bpe_v3(
         vocab[len(vocab)] = new_token
         merges.append((token1, token2))
 
-        # 由于 token1 和 token2 已经被合并，那么 counts 不应该出现它们的组合
-        counts[(token1, token2)] = 0
-
         def merge_helper(t1, t2):
             for chunk, k in chunks.items():
                 bs = hash[chunk]
-                new_bs: list(bytes) = []
+                new_bs: list[bytes] = []
+
+                need_update = False
                 idx = 0
                 while idx < len(bs):
                     if idx + 1 < len(bs) and bs[idx] == t1 and bs[idx+1] == t2:
                         new_bs.append(t1 + t2)
                         if idx - 1 >= 0:
                             counts[(bs[idx-1], t1)] -= k
-                            counts[(bs[idx-1], t1 + t2)] += k
+                        counts[(t1, t2)] -= k
                         if idx + 2 < len(bs):
                             counts[(t2, bs[idx+2])] -= k
-                            counts[(t1 + t2, bs[idx+2])] += k
+
                         idx += 2
+                        need_update = True
                     else:
                         new_bs.append(bs[idx])
                         idx += 1
+
+                if need_update:
+                    for pair in zip(new_bs[:-1], new_bs[1:]):
+                        new_token = t1 + t2
+                        if pair[0] == new_token or pair[1] == new_token:
+                            counts[pair] += k
                 hash[chunk] = new_bs
 
         merge_helper(token1, token2)
