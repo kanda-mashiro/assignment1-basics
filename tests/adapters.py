@@ -685,56 +685,27 @@ def run_train_bpe(
             bytes_list = chunk_cnt[chunk]["bytes_list"]
             new_bytes_list = []
             idx = 0
+            replace_flag = False
             while idx < len(bytes_list):
                 if idx + 1 < len(bytes_list) and \
                         bytes_list[idx] == target_pair[0] and bytes_list[idx+1] == target_pair[1]:
 
-
-
-                    new_bytes_list.append(target_pair[0] + target_pair[1])
-                    # old
-                    pairs: list[tuple[bytes, bytes]] = [(bytes_list[idx], bytes_list[idx+1])]
-                    if idx + 2 < len(bytes_list):
-                        pairs.append((bytes_list[idx+1], bytes_list[idx+2]))
-                    if idx - 1 >= 0:
-                        pairs.append((bytes_list[idx-1], bytes_list[idx]))
-
-                    # print("chunk|", chunk, "| ", chunk_cnt[chunk], "| ", bytes_list_to_pair(bytes_list))
-                    # print("pairs|", pairs)
-                    # print("target_pairs|", target_pair)
-
-                    print(chunk_cnt[chunk])
-                    print("========")
-                    print(chunk)
-                    print("========")
-                    print(pairs)
-                    print("========")
-                    global pair_cnt
-                    for pair in pairs:
-                        # print(pair)
-                        # if pair in pair_cnt:
-                        pair_cnt[pair] -= cnt
-
-
-                    # new
-                    #[idx, idx+1] -> [idx]
-                    new_pairs = []
-                    if len(new_bytes_list) > 0:
-                        new_pairs.append((new_bytes_list[-1], new_token))
-                    if idx + 2 < len(bytes_list):
-                        new_pairs.append((new_token, bytes_list[idx+2]))
-                    
-
-                    for pair in new_pairs:
-                        if pair not in pair_cnt:
-                            pair_cnt[pair] = 0
-                        pair_cnt[pair] += cnt
-
+                    new_bytes_list.append(new_token)
                     idx += 2
+                    replace_flag = True
                     continue
 
                 new_bytes_list.append(bytes_list[idx])
                 idx += 1
+            
+            if replace_flag:
+                for pair in bytes_list_to_pair(bytes_list):
+                    pair_cnt[pair] -= cnt
+                
+                for pair in bytes_list_to_pair(new_bytes_list):
+                    if pair not in pair_cnt:
+                        pair_cnt[pair] = 0
+                    pair_cnt[pair] += cnt
 
             # print(chunk, '|', new_token, '|', new_bytes_list)
             chunk_cnt[chunk]["bytes_list"] = new_bytes_list
@@ -804,7 +775,7 @@ def run_train_bpe(
     # print(pair_cnt)
 
     while len(vocab) < vocab_size:
-        print(len(vocab), "target: ", vocab_size)
+        # print(len(vocab), "target: ", vocab_size)
         max_pair = find_freq_pair()
         new_token = max_pair[0] + max_pair[1]
         vocab[get_new_id()] = new_token
