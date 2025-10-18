@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections import defaultdict
 from collections.abc import Iterable
-from multiprocessing import Pool, Manager
+from multiprocessing import Pool
 from threading import Thread
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -13,6 +13,7 @@ import os
 import re
 import torch
 import tqdm
+import time
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.timer_utils import timer
@@ -674,6 +675,20 @@ def run_train_bpe_v1(
 
     return (vocab, merges)
 
+def pretokenization(input_path, start, end, special_tokens) -> dict[str, int]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    chunks: dict[str, int] = defaultdict(int)
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode('utf-8')
+        pattern = "|".join([re.escape(token) for token in special_tokens])
+        for item in re.split(pattern, chunk):
+            if len(item) != 0:
+                # 预分词
+                import regex
+                for x in regex.findall(PAT, item):
+                    chunks[x] += 1
+    return chunks
 
 @timer
 def run_train_bpe_v2(
@@ -703,25 +718,25 @@ def run_train_bpe_v2(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
     # 从文件中读取字符串
     # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
     # 2. 移除 special_token
-    chunks: dict[str, int] = defaultdict(int)
-    desired_num_chunks = 4
+    start = time.time()
+    desired_num_chunks = 1000
     with open(input_path, "rb") as f:
         # Q: 只考虑 <|endoftext|> 是否可行？是否需要考虑所有的 special_tokens？
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode('utf-8')
-            pattern = "|".join([re.escape(token) for token in special_tokens])
-            for item in re.split(pattern, chunk):
-                if len(item) != 0:
-                    # 预分词
-                    import regex
-                    for x in regex.findall(PAT, item):
-                        chunks[x] += 1
+
+    pool = Pool(10)
+    results = pool.starmap(pretokenization, [
+        (input_path, start, end, special_tokens) for (start, end) in zip(boundaries[:-1], boundaries[1:])])
+    chunks: dict[str, int] = defaultdict(int)
+    for result in results:
+        for chunk, k in result.items():
+            chunks[chunk] += k
+    end = time.time()
+    print(f"pre: {end-start}")
 
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
