@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from multiprocessing import Pool
 import os
 import re
 from collections import defaultdict
@@ -7,6 +9,7 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+from regex import P
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -504,6 +507,10 @@ def run_get_lr_cosine_schedule(
     """
     raise NotImplementedError
 
+# key -> str
+# value -> {cnt: int, pairs: list[tuple[bytes, bytes]]}
+chunk_cnt = {}
+pair_cnt = {}
 
 def run_save_checkpoint(
     model: torch.nn.Module,
@@ -568,16 +575,46 @@ def get_tokenizer(
     raise NotImplementedError
 
 
-def pre_tokenizer(chunk: str) -> list[bytes]:
+def pre_tokenizer(chunk: str) -> list[str]:
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     import regex as re
 
     chunks = re.findall(PAT, chunk)
     return [
-        chunk.encode("utf-8")
+        chunk
         for chunk in chunks
     ]
 
+def chunk2pairCount(chunk: list[bytes]) -> dict[tuple[bytes, bytes], int]:
+        all_pair = zip(chunk[0:-1], chunk[1:])
+        result: dict[tuple[bytes, bytes], int] = {}
+        s = list_bytes_to_str(chunk)
+        s_cnt = chunk_cnt[s]
+
+        for pair in all_pair:
+            if pair not in result:
+                result[pair] = 0
+            result[pair] += s_cnt
+
+        return result
+
+def merge_pairCount(
+    left: dict[tuple[bytes, bytes], int], right: dict[tuple[bytes, bytes], int]
+) -> dict[tuple[bytes, bytes], int]:
+    result = left
+    for pair in right:
+        cnt = right[pair]
+        if pair in result:
+            result[pair] += cnt
+        else:
+            result[pair] = cnt
+    return result
+
+def list_bytes_to_str(b: list[bytes]) -> str:
+    return f'{b}'
+
+def bytes_list_to_pair(bytes_list: list[bytes]) -> list[tuple[bytes, bytes]]:
+    return list(zip(bytes_list[0:-1], bytes_list[1:]))
 
 @timer
 def run_train_bpe(
@@ -620,70 +657,90 @@ def run_train_bpe(
             chunk = f.read(end - start).decode("utf-8")
             pattern = "|".join([re.escape(token) for token in special_tokens])
             for item in re.split(pattern, chunk):
-                item = item.strip()
                 if len(item) != 0:
-                    chunks.append(item.encode("utf-8"))
+                    chunks.append(item)
 
-    # chunk -> ((bytes, bytes), pair_count)
-    def chunk2pairCount(chunk: list[bytes]) -> dict[tuple[bytes, bytes], int]:
-        all_pair = zip(chunk[0:-1], chunk[1:])
-        result: dict[tuple[bytes, bytes], int] = {}
+    def find_freq_pair() -> tuple[bytes, bytes]:
+        max_cnt = max(pair_cnt.values())
+        max_pairs = []
+        for pair, cnt in pair_cnt.items():
+            if cnt != max_cnt:
+                continue
+            max_pairs.append(pair)
+        return max(max_pairs)
 
-        for pair in all_pair:
-            if pair not in result:
-                result[pair] = 1
-            else:
-                result[pair] += 1
-
-        return result
-
-    def merge_pairCount(
-        left: dict[tuple[bytes, bytes], int], right: dict[tuple[bytes, bytes], int]
-    ) -> dict[tuple[bytes, bytes], int]:
-        result = left
-        for pair in right:
-            cnt = right[pair]
-            if pair in result:
-                result[pair] += cnt
-            else:
-                result[pair] = cnt
-        return result
-
-    def find_freq_pair(byte_chunks: list[list[bytes]]) -> tuple[bytes, bytes]:
-        from functools import reduce
-
-        pair_cnts = reduce(merge_pairCount, map(chunk2pairCount, byte_chunks))
-        max_cnt = max([x[1] for x in pair_cnts.items()])
-        max_pair = max([x[0] for x in filter(lambda x: x[1] == max_cnt, pair_cnts.items())])
-
-        return max_pair
 
     # 替换 byte_chunks 里对应的 内容
-    def replace_token(chunks: list[bytes], max_pair: tuple[bytes, bytes]):
-        new_token = max_pair[0] + max_pair[1]
-        replaced_chunks: list[bytes] = []
-        idx = 0
-        while idx < len(chunks):
-            if (idx + 1) < len(chunks) and chunks[idx] == max_pair[0] and chunks[idx + 1] == max_pair[1]:
-                replaced_chunks.append(new_token)
-                idx += 2
-            else:
-                replaced_chunks.append(chunks[idx])
+    def replace_token(target_pair: tuple[bytes, bytes]):
+        """
+        key: str
+        value: {
+            "cnt": {chunk_cnt}
+            "bytes_list": ...
+        }
+        """
+        new_token = target_pair[0] + target_pair[1]
+        for chunk in chunk_cnt:
+            cnt = chunk_cnt[chunk]["cnt"]
+            bytes_list = chunk_cnt[chunk]["bytes_list"]
+            new_bytes_list = []
+            idx = 0
+            while idx < len(bytes_list):
+                if idx + 1 < len(bytes_list) and \
+                        bytes_list[idx] == target_pair[0] and bytes_list[idx+1] == target_pair[1]:
+
+
+
+                    new_bytes_list.append(target_pair[0] + target_pair[1])
+                    # old
+                    pairs: list[tuple[bytes, bytes]] = [(bytes_list[idx], bytes_list[idx+1])]
+                    if idx + 2 < len(bytes_list):
+                        pairs.append((bytes_list[idx+1], bytes_list[idx+2]))
+                    if idx - 1 >= 0:
+                        pairs.append((bytes_list[idx-1], bytes_list[idx]))
+
+                    # print("chunk|", chunk, "| ", chunk_cnt[chunk], "| ", bytes_list_to_pair(bytes_list))
+                    # print("pairs|", pairs)
+                    # print("target_pairs|", target_pair)
+
+                    print(chunk_cnt[chunk])
+                    print("========")
+                    print(chunk)
+                    print("========")
+                    print(pairs)
+                    print("========")
+                    global pair_cnt
+                    for pair in pairs:
+                        # print(pair)
+                        # if pair in pair_cnt:
+                        pair_cnt[pair] -= cnt
+
+
+                    # new
+                    #[idx, idx+1] -> [idx]
+                    new_pairs = []
+                    if len(new_bytes_list) > 0:
+                        new_pairs.append((new_bytes_list[-1], new_token))
+                    if idx + 2 < len(bytes_list):
+                        new_pairs.append((new_token, bytes_list[idx+2]))
+                    
+
+                    for pair in new_pairs:
+                        if pair not in pair_cnt:
+                            pair_cnt[pair] = 0
+                        pair_cnt[pair] += cnt
+
+                    idx += 2
+                    continue
+
+                new_bytes_list.append(bytes_list[idx])
                 idx += 1
 
-        return replaced_chunks
+            # print(chunk, '|', new_token, '|', new_bytes_list)
+            chunk_cnt[chunk]["bytes_list"] = new_bytes_list
 
-    chunk_groups = [pre_tokenizer(chunk.decode()) for chunk in chunks]
-    chunks_map = {}
-    for group in chunk_groups:
-        for sub_chunks in group:
-            for chunk in sub_chunks:
-                if chunk not in chunks_map:
-                    chunks_map[chunk] = 0
-                chunks_map[chunk] += 1
 
     _id = -1
-
     def get_new_id() -> int:
         nonlocal _id
         _id += 1
@@ -691,9 +748,12 @@ def run_train_bpe(
 
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
+    global data, chunk_cnt, pair_cnt
+    data = {}
+    chunk_cnt = {}
+    pair_cnt = {}
 
     # 1. 初始化词表
-    # 
     tokens = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
 
     # 1.2.2 control token
@@ -716,27 +776,56 @@ def run_train_bpe(
 
 
     # 2. pre tokenizer
-    # 对于每个 chunk，拆成词级别的chunk，后面大规模并行
     groups = [
-        pre_tokenizer(chunk.decode("utf-8"))
+        pre_tokenizer(chunk)
         for chunk in chunks
     ]
-    chunks = []
-    for group in groups:
-        chunks.extend(group)
+    
 
-    byte_chunks: list[list[bytes]] = [[chunk[idx : idx + 1] for idx in range(len(chunk))] for chunk in chunks]
+    for group in groups:
+        for chunk in group:
+            if chunk not in chunk_cnt:
+                byte_chunk = chunk.encode("utf-8")
+                bytes_list = [byte_chunk[idx : idx + 1] for idx in range(len(byte_chunk))]
+                chunk_cnt[chunk] = {
+                    "bytes_list": bytes_list,
+                    "cnt": 0
+                }
+            chunk_cnt[chunk]["cnt"] += 1
+
+    for chunk in chunk_cnt:
+        cnt = chunk_cnt[chunk]["cnt"]
+        
+        for pair in bytes_list_to_pair(chunk_cnt[chunk]["bytes_list"]):
+            if pair not in pair_cnt:
+                pair_cnt[pair] = 0
+            pair_cnt[pair] += cnt
+
+    # print(pair_cnt)
 
     while len(vocab) < vocab_size:
-        max_pair = find_freq_pair(byte_chunks)
-
+        print(len(vocab), "target: ", vocab_size)
+        max_pair = find_freq_pair()
         new_token = max_pair[0] + max_pair[1]
         vocab[get_new_id()] = new_token
         merges.append(max_pair)
+        replace_token(max_pair)
 
-        byte_chunks = list([replace_token(chunks, max_pair) for chunks in byte_chunks])
-
-    print('fuck')
-    print(merges)
+    # print('fuck')
+    # print(merges)
 
     return (vocab, merges)
+
+
+
+# 'i' 'n' 'i' 'n'
+# ('i', 'n')
+# ('n', 'i')
+# ('i', 'n')
+# ('n', 'i')
+
+# training
+
+# ('in', 'i')
+# ('n', 'in')
+# ('in', 'in')
