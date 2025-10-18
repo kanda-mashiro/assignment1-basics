@@ -13,6 +13,7 @@ from torch import Tensor
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.timer_utils import timer
+from tests.common import gpt2_bytes_to_unicode
 
 
 def run_linear(
@@ -566,6 +567,18 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+
+def pre_tokenizer(chunk: str) -> list[bytes]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    import regex as re
+
+    chunks = re.findall(PAT, chunk)
+    return [
+        chunk.encode("utf-8")
+        for chunk in chunks
+    ]
+
+
 @timer
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -604,62 +617,126 @@ def run_train_bpe(
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
-            chunk = f.read(end - start).decode('utf-8')
+            chunk = f.read(end - start).decode("utf-8")
             pattern = "|".join([re.escape(token) for token in special_tokens])
             for item in re.split(pattern, chunk):
                 item = item.strip()
                 if len(item) != 0:
-                    chunks.append(item.encode('utf-8'))
+                    chunks.append(item.encode("utf-8"))
 
+    # chunk -> ((bytes, bytes), pair_count)
+    def chunk2pairCount(chunk: list[bytes]) -> dict[tuple[bytes, bytes], int]:
+        all_pair = zip(chunk[0:-1], chunk[1:])
+        result: dict[tuple[bytes, bytes], int] = {}
+
+        for pair in all_pair:
+            if pair not in result:
+                result[pair] = 1
+            else:
+                result[pair] += 1
+
+        return result
+
+    def merge_pairCount(
+        left: dict[tuple[bytes, bytes], int], right: dict[tuple[bytes, bytes], int]
+    ) -> dict[tuple[bytes, bytes], int]:
+        result = left
+        for pair in right:
+            cnt = right[pair]
+            if pair in result:
+                result[pair] += cnt
+            else:
+                result[pair] = cnt
+        return result
+
+    def find_freq_pair(byte_chunks: list[list[bytes]]) -> tuple[bytes, bytes]:
+        from functools import reduce
+
+        pair_cnts = reduce(merge_pairCount, map(chunk2pairCount, byte_chunks))
+        max_cnt = max([x[1] for x in pair_cnts.items()])
+        max_pair = max([x[0] for x in filter(lambda x: x[1] == max_cnt, pair_cnts.items())])
+
+        return max_pair
+
+    # 替换 byte_chunks 里对应的 内容
+    def replace_token(chunks: list[bytes], max_pair: tuple[bytes, bytes]):
+        new_token = max_pair[0] + max_pair[1]
+        replaced_chunks: list[bytes] = []
+        idx = 0
+        while idx < len(chunks):
+            if (idx + 1) < len(chunks) and chunks[idx] == max_pair[0] and chunks[idx + 1] == max_pair[1]:
+                replaced_chunks.append(new_token)
+                idx += 2
+            else:
+                replaced_chunks.append(chunks[idx])
+                idx += 1
+
+        return replaced_chunks
+
+    chunk_groups = [pre_tokenizer(chunk.decode()) for chunk in chunks]
+    chunks_map = {}
+    for group in chunk_groups:
+        for sub_chunks in group:
+            for chunk in sub_chunks:
+                if chunk not in chunks_map:
+                    chunks_map[chunk] = 0
+                chunks_map[chunk] += 1
+
+    _id = -1
+
+    def get_new_id() -> int:
+        nonlocal _id
+        _id += 1
+        return _id
 
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
 
-    # 初始化词表
-    # 1. 0-255
-    # 2. special_token
-    for idx in range(0, 256):
-        vocab[idx] = bytes([idx])
-    for special_token in special_tokens:
-        vocab[len(vocab)] = special_token.encode('utf-8')
-    assert len(vocab) == 256 + len(special_tokens)
+    # 1. 初始化词表
+    # 
+    tokens = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
 
-    # 转换 chunks 的格式，便于操作
-    # list[bytes] -> list[list[bytes]]
-    new_chunks: list[list[bytes]] = []
-    for chunk in chunks:
-        new_chunks.append([chunk[idx:idx+1] for idx in range(len(chunk))])
+    # 1.2.2 control token
+    for b in range(2**8):
+        if b not in tokens:
+            tokens.append(b)
 
-    # 统计每个 pair 对出现的频率，并寻找频率最高的一个
-    counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
-    for _ in range(0, vocab_size - len(vocab)):
-        for chunk in new_chunks:
-            for pair in zip(chunk[:-1], chunk[1:]):
-                counts[pair] += 1
-        # 先按照频率排序，如果频率相同，则按照字典序排序
-        max_freq = max(counts.items(), key=lambda x:(x[1], x[0]))
+    vocab.update(
+        {
+            get_new_id(): special_token.encode("utf-8")
+            for special_token in special_tokens
+        }
+    )
+    vocab.update(
+        {
+            get_new_id(): bytes([token])
+            for token in tokens
+        }
+    )
 
-        # 每一轮循环都会产生一个新的 token
-        token1, token2 = max_freq[0]
-        new_token = token1 + token2
-        vocab[len(vocab)] = new_token
-        merges.append((token1, token2))
 
-        def merge_helper(chunks, t1, t2):
-            new_chunks: list[list[bytes]] = []
-            for chunk in chunks:
-                idx = 0
-                new_chunk: list[bytes] = []
-                while idx < len(chunk):
-                    if idx + 1 < len(chunk) and chunk[idx] == t1 and chunk[idx+1] == t2:
-                        new_chunk.append(t1 + t2)
-                        idx += 2
-                    else:
-                        new_chunk.append(chunk[idx])
-                        idx += 1
-                new_chunks.append(new_chunk)
-            return new_chunks
-        # 合并 new_chunks 中的相关 token
-        new_chunks = merge_helper(new_chunks, token1, token2)
+    # 2. pre tokenizer
+    # 对于每个 chunk，拆成词级别的chunk，后面大规模并行
+    groups = [
+        pre_tokenizer(chunk.decode("utf-8"))
+        for chunk in chunks
+    ]
+    chunks = []
+    for group in groups:
+        chunks.extend(group)
+
+    byte_chunks: list[list[bytes]] = [[chunk[idx : idx + 1] for idx in range(len(chunk))] for chunk in chunks]
+
+    while len(vocab) < vocab_size:
+        max_pair = find_freq_pair(byte_chunks)
+
+        new_token = max_pair[0] + max_pair[1]
+        vocab[get_new_id()] = new_token
+        merges.append(max_pair)
+
+        byte_chunks = list([replace_token(chunks, max_pair) for chunks in byte_chunks])
+
+    print('fuck')
+    print(merges)
 
     return (vocab, merges)

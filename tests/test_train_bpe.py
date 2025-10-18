@@ -58,6 +58,11 @@ def test_train_bpe():
         }
     # Rather than checking that the vocabs exactly match (since they could
     # have been constructed differently, we'll make sure that the vocab keys and values match)
+
+    for idx in range(0, 500):
+        print(vocab[idx], reference_vocab[idx])
+        assert vocab[idx] == reference_vocab[idx]
+
     assert set(vocab.keys()) == set(reference_vocab.keys())
     assert set(vocab.values()) == set(reference_vocab.values())
 
