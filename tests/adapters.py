@@ -10,11 +10,12 @@ from torch import Tensor
 from typing import IO, Any, BinaryIO
 import numpy.typing as npt
 import os
-import re
+import regex
 import torch
 import tqdm
 import time
 
+from cs336_basics import PAT
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.timer_utils import timer
 from cs336_basics.tokenizer import Tokenizer
@@ -572,6 +573,18 @@ def get_tokenizer(
     """
     return Tokenizer(vocab, merges, special_tokens)
 
+def pretokenization(input_path, start, end, special_tokens) -> dict[str, int]:
+    chunks: dict[str, int] = defaultdict(int)
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode('utf-8')
+        pattern = "|".join([regex.escape(token) for token in special_tokens])
+        for item in regex.split(pattern, chunk):
+            if len(item) != 0:
+                for x in regex.findall(PAT, item):
+                    chunks[x] += 1
+    return chunks
+
 @timer
 def run_train_bpe_v1(
     input_path: str | os.PathLike,
@@ -600,7 +613,6 @@ def run_train_bpe_v1(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     # 从文件中读取字符串
     # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
     # 2. 移除 special_token
@@ -612,12 +624,10 @@ def run_train_bpe_v1(
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
             chunk = f.read(end - start).decode('utf-8')
-            pattern = "|".join([re.escape(token) for token in special_tokens])
-            for item in re.split(pattern, chunk):
+            pattern = "|".join([regex.escape(token) for token in special_tokens])
+            for item in regex.split(pattern, chunk):
                 item = item.strip()
                 if len(item) != 0:
-                    # 预分词
-                    import regex
                     for x in regex.findall(PAT, item):
                         chunks.append(x.encode('utf-8'))
 
@@ -675,21 +685,6 @@ def run_train_bpe_v1(
 
     return (vocab, merges)
 
-def pretokenization(input_path, start, end, special_tokens) -> dict[str, int]:
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    chunks: dict[str, int] = defaultdict(int)
-    with open(input_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode('utf-8')
-        pattern = "|".join([re.escape(token) for token in special_tokens])
-        for item in re.split(pattern, chunk):
-            if len(item) != 0:
-                # 预分词
-                import regex
-                for x in regex.findall(PAT, item):
-                    chunks[x] += 1
-    return chunks
-
 @timer
 def run_train_bpe_v2(
     input_path: str | os.PathLike,
@@ -723,7 +718,7 @@ def run_train_bpe_v2(
     # 1. 按照 special_token 去寻找边界，避免将 special_token 拆分成多个部分
     # 2. 移除 special_token
     start = time.time()
-    desired_num_chunks = 1000
+    desired_num_chunks = 10
     with open(input_path, "rb") as f:
         # Q: 只考虑 <|endoftext|> 是否可行？是否需要考虑所有的 special_tokens？
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
@@ -736,7 +731,7 @@ def run_train_bpe_v2(
         for chunk, k in result.items():
             chunks[chunk] += k
     end = time.time()
-    print(f"pre: {end-start}")
+    print(f"pretokenzation: {end-start:.4f} s")
 
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
