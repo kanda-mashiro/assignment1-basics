@@ -92,7 +92,7 @@ class NumpySnapshot:
                 expected_arrays[key],
                 rtol=rtol,
                 atol=atol,
-                err_msg=f"Array '{key}' does not match snapshot for {test_name}",
+                err_msg=f"Array '{key}, {expected_arrays[key].shape}' does not match snapshot for {test_name}",
             )
 
 

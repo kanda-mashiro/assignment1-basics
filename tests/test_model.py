@@ -55,6 +55,10 @@ def test_swiglu(numpy_snapshot, ts_state_dict, in_embeddings, d_model, d_ff):
 
 
 def test_scaled_dot_product_attention(numpy_snapshot, q, k, v, mask):
+    # q: [4, 12, 64]
+    # k: [4, 16, 64]
+    # v: [4, 16, 64]
+    # mask: [4, 12, 16]
     actual_output = run_scaled_dot_product_attention(Q=q, K=k, V=v, mask=mask)
     numpy_snapshot.assert_match(
         actual_output,
@@ -80,13 +84,13 @@ def test_multihead_self_attention(numpy_snapshot, in_embeddings, d_model, n_head
         d[f"layers.0.attn.{k}_proj.weight"] for k in ["q", "k", "v", "output"]
     ]
     actual_output = run_multihead_self_attention(
-        d_model=d_model,
-        num_heads=n_heads,
-        q_proj_weight=q_proj_weight,
-        k_proj_weight=k_proj_weight,
-        v_proj_weight=v_proj_weight,
-        o_proj_weight=o_proj_weight,
-        in_features=in_embeddings,
+        d_model=d_model,                # 64
+        num_heads=n_heads,              # 4
+        q_proj_weight=q_proj_weight,    # [64, 64]
+        k_proj_weight=k_proj_weight,    # [64, 64]
+        v_proj_weight=v_proj_weight,    # [64, 64]
+        o_proj_weight=o_proj_weight,    # [64, 64]
+        in_features=in_embeddings,      # [4, 12, 64]
     )
     numpy_snapshot.assert_match(actual_output, atol=1e-6)
 
@@ -184,6 +188,11 @@ def test_rmsnorm(numpy_snapshot, ts_state_dict, in_embeddings):
 
 
 def test_rope(numpy_snapshot, in_embeddings, d_model, theta, n_queries, pos_ids):
+    # in_embeddings.shape = [4, 12, 64]
+    # d_model = 64
+    # theta = 10000.0
+    # n_queries = 12
+    # pos_ids = [0, 1, ..., 11]
     output = run_rope(
         d_model, theta=theta, max_seq_len=n_queries, in_query_or_key=in_embeddings, token_positions=pos_ids
     )
