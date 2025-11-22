@@ -2,6 +2,7 @@ import time
 import regex as rex
 import re
 from multiprocessing import Pool
+import os
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
@@ -114,7 +115,12 @@ def pre_tokenize(input_path: str, start: int, end: int, special_tokens: list[str
     return item_cnt
 
 def multi_run_wrapper(args):
-   return pre_tokenize(*args)
+    yappi.set_clock_type("cpu")
+    yappi.start()
+    result = pre_tokenize(*args)
+    yappi.stop()
+    yappi.get_func_stats().save(f'yappi_{os.getpid()}.prof', type='pstat')
+    return result
 
 def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
     # 从文件中读取字符串
@@ -147,11 +153,11 @@ def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
                 else:
                     chunk_cnt[chunk]["cnt"] += item_cnt[chunk]["cnt"]
 
-        # chunk_cnt = multi_run_wrapper((input_path, boundaries[0], boundaries[1], special_tokens))
-
-    
-    
+        # chunk_cnt = multi_run_wrapper((input_path, boundaries[0], boundaries[1], special_tokens))    
     print(time.time() - start)
+    vocab: dict[int, bytes] = {}
+    merges: list[tuple[bytes, bytes]] = []
+    # return (vocab, merges)
 
 
     _id = -1
@@ -159,9 +165,6 @@ def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
         nonlocal _id
         _id += 1
         return _id
-
-    vocab: dict[int, bytes] = {}
-    merges: list[tuple[bytes, bytes]] = []
 
     # 1. 初始化词表
     tokens = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
