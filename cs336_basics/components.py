@@ -1,9 +1,11 @@
+from collections.abc import Callable, Iterable
 from einops import einsum, rearrange
-from typing import override, Mapping, Any
+from typing import override, Mapping, Any, Optional
 
 import math
 import torch
 import torch.nn as nn
+import torch.optim as optim
 
 
 class Linear(nn.Module):
@@ -279,3 +281,77 @@ class TransformerLM(nn.Module):
         x = self.ln_final.forward(x)
         x = self.lm_head.forward(x)
         return x
+
+
+def cross_entropy_v0(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    logits -= logits.max(-1).values.unsqueeze(-1) 
+    selectd = logits[torch.arange(logits.shape[0]), targets]
+    exp_sum = logits.exp().sum(-1)
+    return -(selectd - exp_sum.log()).sum() / logits.shape[0]
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    max_val = logits.max(-1).values
+    x = (logits - max_val.unsqueeze(-1)).exp().sum(-1).log() + max_val - logits[torch.arange(logits.shape[0]), targets]
+    return x.mean()
+
+class AdamW(optim.Optimizer):
+    def __init__(self, params, lr, weight_decay, betas, eps) -> None:
+        defaults = {}
+        self.lr = lr
+        self.b1 = betas[0]
+        self.b2 = betas[1]
+        self.eps = eps
+        self.decay = weight_decay
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                
+                m = state.get("m", torch.zeros(p.shape))
+                v = state.get("v", torch.zeros(p.shape))
+                t = state.get("t", 1)
+
+                grad = p.grad.data
+                m = self.b1 * m + (1 - self.b1) * grad
+                v = self.b2 * v + (1 - self.b2) * grad * grad
+                lr1 = self.lr
+                lr2 = lr1 * math.sqrt(1 - self.b2 ** t) / (1 - self.b1 ** t)
+                p.data -= lr2 * m / (v.sqrt() + self.eps)
+                p.data -= lr1 * self.decay * p.data
+
+                state["m"] = m
+                state["v"] = v
+                state["t"] = t + 1
+
+        return loss
+
+
+def lr_cosine_schedule(it: int, max_lr: float, min_lr: float, warmup: int, cos_it: int) -> float:
+    if it < warmup:
+        return it / warmup * max_lr
+    if warmup <= it <= cos_it:
+        return min_lr + (1 + math.cos((it - warmup)/(cos_it - warmup) * math.pi)) * (max_lr - min_lr) * 0.5
+    return min_lr
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    s = 0
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        s += grad.pow(2).sum()
+    
+    l2_norm = s.sqrt()
+    if l2_norm < max_l2_norm:
+        return
+    
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        grad *= max_l2_norm / (l2_norm + 1e-6)
