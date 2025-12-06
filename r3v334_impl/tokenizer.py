@@ -14,8 +14,6 @@ def pre_tokenize(s: str, special_tokens: list[str]) -> list[str]:
     else:
         chunks = [s]
 
-    print("cunks", chunks)
-
     
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -48,7 +46,7 @@ class Tokenizer:
                 key= lambda x: len(x),
                 reverse=True
             )
-        print("spt: ", special_tokens)
+        # print("spt: ", special_tokens)
 
         # max_key = max(vocab.keys())
         # if special_tokens:
@@ -123,9 +121,6 @@ class Tokenizer:
     def encode(self, s: str) -> list[int]:
         # 1. pre_tokenizer
         pretokens = pre_tokenize(s, self.special_tokens)
-        print("fuck", pretokens)
-        print("special_tokens: ", self.special_tokens)
-        print("raw", s)
 
         # 2. apply the merge(从上到下)
         # 直到没有 merge 可用
@@ -143,7 +138,7 @@ class Tokenizer:
             for token_id in subresult:
                 result.append(token_id)
 
-        print(f"s: {s}", f"reult: {result}")
+        # print(f"s: {s}", f"reult: {result}")
 
         return result
 

@@ -3,6 +3,7 @@ import regex as rex
 import re
 from multiprocessing import Pool
 import os
+import yappi
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
@@ -115,11 +116,11 @@ def pre_tokenize(input_path: str, start: int, end: int, special_tokens: list[str
     return item_cnt
 
 def multi_run_wrapper(args):
-    yappi.set_clock_type("cpu")
-    yappi.start()
+    # yappi.set_clock_type("cpu")
+    # yappi.start()
     result = pre_tokenize(*args)
-    yappi.stop()
-    yappi.get_func_stats().save(f'yappi_{os.getpid()}.prof', type='pstat')
+    # yappi.stop()
+    # yappi.get_func_stats().save(f'yappi_{os.getpid()}.prof', type='pstat')
     return result
 
 def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
@@ -153,8 +154,8 @@ def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
                 else:
                     chunk_cnt[chunk]["cnt"] += item_cnt[chunk]["cnt"]
 
-        # chunk_cnt = multi_run_wrapper((input_path, boundaries[0], boundaries[1], special_tokens))    
-    print(time.time() - start)
+    # chunk_cnt = multi_run_wrapper((input_path, boundaries[0], boundaries[1], special_tokens))    
+    # print(time.time() - start)
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
     # return (vocab, merges)
@@ -198,7 +199,7 @@ def train_bpe(input_path: str, special_tokens: list[str], vocab_size: int):
     # print(pair_cnt)
 
     while len(vocab) < vocab_size:
-        print(len(vocab), "target: ", vocab_size)
+        # print(len(vocab), "target: ", vocab_size)
         max_pair = find_freq_pair()
         new_token = max_pair[0] + max_pair[1]
         vocab[get_new_id()] = new_token
