@@ -1,8 +1,11 @@
 from collections.abc import Callable, Iterable
 from einops import einsum, rearrange
-from typing import override, Mapping, Any, Optional
+from typing import override, Mapping, Any, Optional, IO, BinaryIO
 
 import math
+import numpy.typing as npt
+import os
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -80,9 +83,9 @@ class SwiGLU(nn.Module):
         self.d_model = d_model
         self.d_ff = d_ff
 
-        w1 = torch.randn([self.d_ff, self.d_model])
-        w2 = torch.randn([self.d_model, self.d_ff])
-        w3 = torch.randn([self.d_ff, self.d_model])
+        w1 = torch.randn([self.d_ff, self.d_model], device=device)
+        w2 = torch.randn([self.d_model, self.d_ff], device=device)
+        w3 = torch.randn([self.d_ff, self.d_model], device=device)
         self.p_w1 = nn.Parameter(w1)
         self.p_w2 = nn.Parameter(w2)
         self.p_w3 = nn.Parameter(w3)
@@ -105,7 +108,7 @@ class RoPE(nn.Module):
         self.d_k = d_k
         self.max_seq_len = max_seq_len
 
-        r = torch.zeros([max_seq_len, d_k, d_k])
+        r = torch.zeros([max_seq_len, d_k, d_k], device=device)
         for idx in range(max_seq_len):
             for k in range(self.d_k // 2):
                 theta_i_k = idx / self.theta**((2*k)/self.d_k)
@@ -215,10 +218,10 @@ class MultiHeadSelfAttentionWithRoPE(nn.Module):
         self.num_head = num_head
         self.d_head = self.d_model // self.num_head
 
-        q = torch.randn([d_model, d_model])
-        k = torch.randn([d_model, d_model])
-        v = torch.randn([d_model, d_model])
-        o = torch.randn([d_model, d_model])
+        q = torch.randn([d_model, d_model], device=device)
+        k = torch.randn([d_model, d_model], device=device)
+        v = torch.randn([d_model, d_model], device=device)
+        o = torch.randn([d_model, d_model], device=device)
 
         self.p_q = nn.Parameter(q)
         self.p_k = nn.Parameter(k)
@@ -232,14 +235,14 @@ class MultiHeadSelfAttentionWithRoPE(nn.Module):
         v = self.p_v.view(self.num_head, self.d_head, self.d_model)
 
         q = einsum(x, q, "... seq_len d_model, num_head d_head d_model -> ... num_head seq_len d_head")
-        q = RoPE(self.theta, self.d_head, self.max_seq_len).forward(q, token_positions)
+        q = RoPE(self.theta, self.d_head, self.max_seq_len, device=x.device).forward(q, token_positions)
         k = einsum(x, k, "... seq_len d_model, num_head d_head d_model -> ... num_head seq_len d_head")
-        k = RoPE(self.theta, self.d_head, self.max_seq_len).forward(k, token_positions)
+        k = RoPE(self.theta, self.d_head, self.max_seq_len, device=x.device).forward(k, token_positions)
         v = einsum(x, v, "... seq_len d_model, num_head d_head d_model -> ... num_head seq_len d_head")
         qk = einsum(q, k, "... num_head seq_q_len d_head, ... num_head seq_kv_len d_head -> ... num_head seq_q_len seq_kv_len")
 
         seq_len = x.shape[-2]
-        mask = torch.tril(torch.ones([seq_len, seq_len], dtype=torch.bool))
+        mask = torch.tril(torch.ones([seq_len, seq_len], dtype=torch.bool)).to(x.device)
         qk = qk.masked_fill(~mask, float("-inf"))
         qk = softmax(qk / math.sqrt(self.d_head), -1)
 
@@ -252,26 +255,26 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_head: int, d_ff: int, max_seq_len: int, theta: float, device: None = None, dtype: None = None) -> None:
         super().__init__()
 
-        self.ln1 = RMSNorm(d_model)
-        self.attn = MultiHeadSelfAttentionWithRoPE(d_model, num_head, max_seq_len, theta)
-        self.ln2 = RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model, d_ff)
+        self.ln1 = RMSNorm(d_model, device=device)
+        self.attn = MultiHeadSelfAttentionWithRoPE(d_model, num_head, max_seq_len, theta, device=device)
+        self.ln2 = RMSNorm(d_model, device=device)
+        self.ffn = SwiGLU(d_model, d_ff, device=device)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x += self.attn.forward(self.ln1.forward(x), torch.arange(0, x.shape[-2], 1))
-        x += self.ffn.forward(self.ln2.forward(x))
+        x = x + self.attn.forward(self.ln1.forward(x), torch.arange(0, x.shape[-2], 1, device=x.device))
+        x = x + self.ffn.forward(self.ln2.forward(x))
         return x
 
 
 class TransformerLM(nn.Module):
-    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, rope_theta: float):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, rope_theta: float, device: None = None):
         super().__init__()
 
-        self.token_emb = Embedding(vocab_size, d_model)
-        self.layers = nn.Sequential(*[TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta) for _ in range(num_layers)])
-        self.ln_final = RMSNorm(d_model)
-        self.lm_head = Linear(d_model, vocab_size)
+        self.token_emb = Embedding(vocab_size, d_model, device=device)
+        self.layers = nn.Sequential(*[TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, device=device) for _ in range(num_layers)])
+        self.ln_final = RMSNorm(d_model, device=device)
+        self.lm_head = Linear(d_model, vocab_size, device=device)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -284,7 +287,7 @@ class TransformerLM(nn.Module):
 
 
 def cross_entropy_v0(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    logits -= logits.max(-1).values.unsqueeze(-1) 
+    logits -= logits.max(-1).values.unsqueeze(-1)
     selectd = logits[torch.arange(logits.shape[0]), targets]
     exp_sum = logits.exp().sum(-1)
     return -(selectd - exp_sum.log()).sum() / logits.shape[0]
@@ -311,9 +314,9 @@ class AdamW(optim.Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p]
-                
-                m = state.get("m", torch.zeros(p.shape))
-                v = state.get("v", torch.zeros(p.shape))
+
+                m = state.get("m", torch.zeros(p.shape, device=p.device))
+                v = state.get("v", torch.zeros(p.shape, device=p.device))
                 t = state.get("t", 1)
 
                 grad = p.grad.data
@@ -345,13 +348,40 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
         if grad is None:
             continue
         s += grad.pow(2).sum()
-    
+
     l2_norm = s.sqrt()
     if l2_norm < max_l2_norm:
         return
-    
+
     for parameter in parameters:
         grad = parameter.grad
         if grad is None:
             continue
         grad *= max_l2_norm / (l2_norm + 1e-6)
+
+
+def gen_dataset(x: npt.NDArray, b: int, s: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+
+    samples = torch.zeros([b, s], dtype=torch.int32, device=device)
+    labels = torch.zeros([b, s], dtype=torch.int32, device=device)
+    for it in range(b):
+        random_pos = random.randint(0, len(x) - s - 1)
+        samples[it] = torch.from_numpy(x[random_pos:random_pos+s])
+        labels[it] = torch.from_numpy(x[random_pos+1:random_pos+s+1])
+
+    return samples, labels
+
+
+def save_checkpoint(model: nn.Module, optimizer: optim.Optimizer, iteration: int, out: str | os.PathLike | BinaryIO | IO[bytes]):
+    cp = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(cp, out)
+
+def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes], model: nn.Module, optimizer: optim.Optimizer) -> int:
+    cp = torch.load(src)
+    model.load_state_dict(cp["model"])
+    optimizer.load_state_dict(cp["optimizer"])
+    return cp["iteration"]
